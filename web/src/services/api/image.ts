@@ -70,12 +70,27 @@ type ResponseApiPayload = {
     msg?: string;
 };
 type ResponseStreamState = { buffer: string; text: string; payload?: ResponseApiPayload; error?: string };
+type ChatCompletionPayload = {
+    choices?: Array<{ delta?: { content?: string }; message?: { content?: string }; finish_reason?: string }>;
+    error?: { message?: string };
+    errors?: { message?: string };
+    message?: string;
+};
+type ChatCompletionState = { buffer: string; text: string; error?: string };
 
 type ImageApiResponse = {
     data?: Array<Record<string, unknown>>;
     error?: { message?: string };
     code?: number;
     msg?: string;
+};
+type ModelScopeImageTask = {
+    task_id?: string;
+    task_status?: "PENDING" | "RUNNING" | "SUCCEED" | "FAILED" | string;
+    output_images?: string[];
+    errors?: { message?: string };
+    error?: { message?: string };
+    message?: string;
 };
 type GeminiPart = {
     text?: string;
@@ -220,6 +235,10 @@ function resolveImageSource(item: Record<string, unknown>) {
     return null;
 }
 
+function imageSourcesToResults(values: string[]) {
+    return values.filter(Boolean).map((dataUrl) => ({ id: nanoid(), dataUrl }));
+}
+
 function parseImagePayload(payload: ImageApiResponse) {
     if (typeof payload.code === "number" && payload.code !== 0) {
         throw new Error(payload.msg || apiText("requestFailed"));
@@ -262,7 +281,7 @@ function readApiErrorMessage(value: unknown): string {
         }
     }
     if (typeof value !== "object") return "";
-    const payload = value as { msg?: unknown; message?: unknown; error?: unknown; detail?: unknown };
+    const payload = value as { msg?: unknown; message?: unknown; error?: unknown; errors?: unknown; detail?: unknown };
     // error may be a string or an object containing a message.
     const errorMsg =
         typeof payload.error === "string"
@@ -272,6 +291,7 @@ function readApiErrorMessage(value: unknown): string {
         readApiErrorMessage(payload.msg) ||
         readApiErrorMessage(payload.message) ||
         readApiErrorMessage(errorMsg) ||
+        readApiErrorMessage(payload.errors) ||
         readApiErrorMessage(payload.detail) ||
         ""
     );
@@ -500,6 +520,66 @@ async function requestStreamingResponse(config: AiConfig, body: Record<string, u
     return { ...result, content: state.text || result.content };
 }
 
+async function requestChatCompletion(config: AiConfig, messages: ResponseInputMessage[], onDelta?: (text: string) => void, options?: RequestOptions): Promise<ToolResponseResult> {
+    const response = await fetch(aiApiUrl(config, "/chat/completions"), {
+        method: "POST",
+        headers: { ...aiHeaders(config, "application/json"), Accept: "text/event-stream" },
+        body: JSON.stringify({ model: config.model, messages: toChatMessages(withSystemMessage(config, messages)), stream: true }),
+        signal: options?.signal,
+    });
+    if (!response.ok) throw new Error(await readFetchError(response, apiText("requestFailed")));
+    if (!response.body) {
+        const payload = (await response.json()) as ChatCompletionPayload;
+        const content = payload.choices?.map((choice) => choice.message?.content || "").join("").trim() || "";
+        return { content, toolCalls: [] };
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const state: ChatCompletionState = { buffer: "", text: "" };
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        consumeChatCompletionText(state, decoder.decode(value, { stream: true }), onDelta);
+        if (state.error) throw new Error(state.error);
+    }
+    consumeChatCompletionText(state, decoder.decode(), onDelta, true);
+    if (state.error) throw new Error(state.error);
+    return { content: state.text, toolCalls: [] };
+}
+
+function consumeChatCompletionText(state: ChatCompletionState, text: string, onDelta?: (text: string) => void, flush = false) {
+    state.buffer += text;
+    const blocks = state.buffer.split("\n\n");
+    state.buffer = flush ? "" : blocks.pop() || "";
+    blocks.forEach((block) => consumeChatCompletionBlock(block, state, onDelta));
+    if (flush && state.buffer) consumeChatCompletionBlock(state.buffer, state, onDelta);
+}
+
+function consumeChatCompletionBlock(block: string, state: ChatCompletionState, onDelta?: (text: string) => void) {
+    const payloads = block.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).filter((line) => line && line !== "[DONE]");
+    for (const item of payloads) {
+        const payload = jsonObject(item) as ChatCompletionPayload;
+        const error = readApiErrorMessage(payload.error || payload.errors || payload.message);
+        if (error) {
+            state.error = error;
+            return;
+        }
+        const delta = payload.choices?.map((choice) => choice.delta?.content || choice.message?.content || "").join("") || "";
+        if (delta) {
+            state.text += delta;
+            onDelta?.(delta);
+        }
+    }
+}
+
+function toChatMessages(messages: ResponseInputMessage[]) {
+    return messages.flatMap((message) => {
+        if ("type" in message) return [];
+        if (message.role === "tool") return [{ role: "tool", tool_call_id: message.tool_call_id, content: message.content }];
+        return [{ role: message.role, content: message.content }];
+    });
+}
+
 function toGeminiBody(config: AiConfig, messages: ResponseInputMessage[], extra?: Record<string, unknown>) {
     const systemText = [
         config.systemPrompt.trim(),
@@ -659,6 +739,57 @@ async function requestGeminiImages(config: AiConfig, prompt: string, references:
     return (await Promise.all(requests)).flat();
 }
 
+async function requestAgnesImages(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
+    const requestSize = resolveRequestSize(config.size) || "1024x1024";
+    const images = await Promise.all(references.map((image) => imageToDataUrl(image)));
+    const extraBody = {
+        response_format: "b64_json",
+        ...(images.length ? { image: images } : {}),
+    };
+    const requests = Array.from({ length: count }, async () => {
+        const response = await axios.post<ImageApiResponse>(aiApiUrl(config, "/images/generations"), {
+            model: config.model,
+            prompt,
+            size: requestSize,
+            return_base64: true,
+            extra_body: extraBody,
+        }, { headers: aiHeaders(config, "application/json"), signal: options?.signal, timeout: IMAGE_REQUEST_TIMEOUT_MS });
+        return parseImagePayload(response.data);
+    });
+    return (await Promise.all(requests)).flat();
+}
+
+async function requestModelScopeImages(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
+    const requestSize = resolveRequestSize(config.size);
+    const images = await Promise.all(references.map((image) => imageToDataUrl(image)));
+    const requests = Array.from({ length: count }, async () => {
+        const created = (await axios.post<ModelScopeImageTask>(aiApiUrl(config, "/images/generations"), {
+            model: config.model,
+            prompt,
+            ...(requestSize ? { size: requestSize } : {}),
+            ...(images.length ? { image_url: images } : {}),
+        }, { headers: { ...aiHeaders(config, "application/json"), "X-ModelScope-Async-Mode": "true" }, signal: options?.signal, timeout: IMAGE_REQUEST_TIMEOUT_MS })).data;
+        if (!created.task_id) throw new Error(readApiErrorMessage(created) || apiText("noImageReturned"));
+        return pollModelScopeImageTask(config, created.task_id, options);
+    });
+    return (await Promise.all(requests)).flat();
+}
+
+async function pollModelScopeImageTask(config: AiConfig, taskId: string, options?: RequestOptions) {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+        if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        const task = (await axios.get<ModelScopeImageTask>(aiApiUrl(config, `/tasks/${taskId}`), { headers: { ...aiHeaders(config), "X-ModelScope-Task-Type": "image_generation" }, signal: options?.signal })).data;
+        if (task.task_status === "SUCCEED") {
+            const images = imageSourcesToResults(task.output_images || []);
+            if (images.length) return images;
+            throw new Error(apiText("noImageReturned"));
+        }
+        if (task.task_status === "FAILED") throw new Error(readApiErrorMessage(task) || apiText("requestFailed"));
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+    }
+    throw new Error(apiText("requestFailed"));
+}
+
 async function requestGeminiImagesOnce(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
     const parts: GeminiPart[] = [{ text: prompt }];
     for (const image of references) {
@@ -717,6 +848,13 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
     if (requestConfig.apiFormat === "gemini") {
         try {
             return await requestGeminiImages(requestConfig, prompt, [], n, options);
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("requestFailed")));
+        }
+    }
+    if (requestConfig.apiFormat === "agnes" || requestConfig.apiFormat === "modelscope") {
+        try {
+            return requestConfig.apiFormat === "agnes" ? await requestAgnesImages(requestConfig, withSystemPrompt(requestConfig, prompt), [], n, options) : await requestModelScopeImages(requestConfig, withSystemPrompt(requestConfig, prompt), [], n, options);
         } catch (error) {
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
@@ -783,6 +921,13 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
     }
+    if (requestConfig.apiFormat === "agnes" || requestConfig.apiFormat === "modelscope") {
+        try {
+            return requestConfig.apiFormat === "agnes" ? await requestAgnesImages(requestConfig, withSystemPrompt(requestConfig, requestPrompt), references, n, options) : await requestModelScopeImages(requestConfig, withSystemPrompt(requestConfig, requestPrompt), references, n, options);
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("requestFailed")));
+        }
+    }
 
     const quality = normalizeQuality(config.quality);
     const requestSize = resolveRequestSize(config.size);
@@ -841,6 +986,11 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
     try {
         if (requestConfig.apiFormat === "gemini") {
             const answer = (await requestGeminiStreamingResponse(requestConfig, toGeminiBody(requestConfig, messages), onDelta, options)).content || apiText("noContent");
+            if (answer === apiText("noContent")) onDelta(answer);
+            return answer;
+        }
+        if (requestConfig.apiFormat === "modelscope") {
+            const answer = (await requestChatCompletion(requestConfig, messages, onDelta, options)).content || apiText("noContent");
             if (answer === apiText("noContent")) onDelta(answer);
             return answer;
         }
